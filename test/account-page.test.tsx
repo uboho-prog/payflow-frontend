@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import AccountPage from "@/app/account/page";
 import type { ApiMandate } from "@/lib/api";
-import { minPauseDate, resumeDate } from "@/lib/format";
+import { minPauseDate, resumeDate, shortAddress } from "@/lib/format";
 
 /**
  * The account page is the first page rendered in tests because it exercises
@@ -28,10 +28,13 @@ const apiMock = vi.hoisted(() => ({
   vaultHistory: vi.fn(),
 }));
 
+import { config } from "@/lib/config";
+
 const payflowMock = vi.hoisted(() => ({
   vaultBalance: vi.fn(),
   deposit: vi.fn(),
   withdraw: vi.fn(),
+  depositFor: vi.fn(),
   setPaused: vi.fn(),
   pauseUntil: vi.fn(),
   cancel: vi.fn(),
@@ -42,6 +45,8 @@ const payflowHelpers = vi.hoisted(() => ({
   mandatePauseUntil: vi.fn(),
   mandateIsPastDue: vi.fn(() => false),
   mandatePastDueUntil: vi.fn(() => null),
+  vaultSupportsDepositFor: vi.fn(),
+  validateRecipient: vi.fn(),
 }));
 
 const chainMock = vi.hoisted(() => ({
@@ -120,7 +125,16 @@ beforeEach(async () => {
   // Default: the deployed contract has no pause_until, so the picker is hidden.
   payflowHelpers.mandatePauseUntil.mockReset();
   payflowHelpers.mandatePauseUntil.mockReturnValue(null);
+  // Default: the deployed contract has no deposit_for, so the sponsor panel is hidden.
+  payflowHelpers.vaultSupportsDepositFor.mockReset();
+  payflowHelpers.vaultSupportsDepositFor.mockResolvedValue(false);
+  payflowHelpers.validateRecipient.mockReset();
   payflowMock.cancel.mockReset();
+  payflowMock.deposit.mockReset();
+  payflowMock.depositFor.mockReset();
+  payflowMock.withdraw.mockReset();
+  payflowMock.setPaused.mockReset();
+  payflowMock.pauseUntil.mockReset();
   payflowMock.readContract.mockReset();
   chainMock.chainMandatesOf.mockReset();
   // The token metadata cache is module-level and outlives a single render.
@@ -536,5 +550,103 @@ describe("AccountPage pause until", () => {
 
     expect(await screen.findByRole("button", { name: "Pause until…" })).toBeTruthy();
     expect(chainMock.chainMandatesOf).toHaveBeenCalledWith(SUBSCRIBER, SUBSCRIBER);
+  });
+});
+
+describe("AccountPage fund another account", () => {
+  const RECIPIENT = MERCHANT;
+  const AMOUNT = "5";
+
+  beforeEach(() => {
+    payflowMock.vaultBalance.mockResolvedValue(0n);
+    apiMock.mandatesOf.mockResolvedValue({ mandates: [] });
+    payflowHelpers.validateRecipient.mockImplementation(
+      (raw) => (raw.trim() === RECIPIENT ? null : "That is not a valid Stellar account address."),
+    );
+  });
+
+  it("hides the sponsor panel when the contract does not support deposit_for", async () => {
+    payflowHelpers.vaultSupportsDepositFor.mockResolvedValue(false);
+
+    render(<AccountPage />);
+    await screen.findByText("No subscriptions yet");
+
+    expect(screen.queryByText(/fund another account/i)).toBeNull();
+    expect(payflowHelpers.vaultSupportsDepositFor).toHaveBeenCalledWith(SUBSCRIBER);
+    expect(payflowMock.depositFor).not.toHaveBeenCalled();
+  });
+
+  it("shows the sponsor panel when the contract supports deposit_for", async () => {
+    payflowHelpers.vaultSupportsDepositFor.mockResolvedValue(true);
+
+    render(<AccountPage />);
+    await screen.findByText(/fund another account/i);
+    expect(screen.getByLabelText(/recipient address/i)).toBeTruthy();
+    expect(document.getElementById("fund-amount")).not.toBeNull();
+  });
+
+  it("rejects an invalid recipient address without signing anything", async () => {
+    payflowHelpers.vaultSupportsDepositFor.mockResolvedValue(true);
+
+    render(<AccountPage />);
+    await screen.findByText(/fund another account/i);
+
+    const recipient = screen.getByLabelText(/recipient address/i) as HTMLInputElement;
+    fireEvent.change(recipient, { target: { value: "not an address" } });
+
+    expect(
+      screen.getByText(/That is not a valid Stellar account address/),
+    ).toBeTruthy();
+    expect(
+      (screen.getByRole("button", { name: /^fund$/i }) as HTMLButtonElement).disabled,
+    ).toBe(true);
+
+    fireEvent.click(screen.getByRole("button", { name: /^fund$/i }));
+    expect(payflowMock.depositFor).not.toHaveBeenCalled();
+  });
+
+  it("shows both parties in the confirmation before sending", async () => {
+    payflowHelpers.vaultSupportsDepositFor.mockResolvedValue(true);
+    payflowMock.depositFor.mockResolvedValue("deposited");
+
+    render(<AccountPage />);
+    await screen.findByText(/fund another account/i);
+
+    const recipient = screen.getByLabelText(/recipient address/i) as HTMLInputElement;
+    const amount = document.getElementById("fund-amount") as HTMLInputElement;
+    fireEvent.change(recipient, { target: { value: RECIPIENT } });
+    fireEvent.change(amount, { target: { value: AMOUNT } });
+
+    fireEvent.click(screen.getByRole("button", { name: /^fund$/i }));
+
+    // Confirmation names sponsor and recipient, and states who can withdraw.
+    expect(screen.getByText(/pays/)).toBeTruthy();
+    expect(screen.getByText(/5 XLM/)).toBeTruthy();
+    expect(screen.getByText(shortAddress(SUBSCRIBER))).toBeTruthy();
+    expect(screen.getAllByText(shortAddress(RECIPIENT))).toHaveLength(2);
+    fireEvent.click(screen.getByRole("button", { name: /^fund$/i }));
+
+    await waitFor(() =>
+      expect(payflowMock.depositFor).toHaveBeenCalledWith(
+        SUBSCRIBER,
+        expect.any(Function),
+        RECIPIENT,
+        config.contracts.token,
+        50_000_000n,
+      ),
+    );
+    expect(screen.getByText(/Done\./)).toBeTruthy();
+  });
+
+  it("disables the sponsor write while the wallet is on the wrong network", async () => {
+    payflowHelpers.vaultSupportsDepositFor.mockResolvedValue(true);
+    wallet.networkMismatch = true;
+
+    render(<AccountPage />);
+    await screen.findByText(/fund another account/i);
+
+    expect(
+      (screen.getByRole("button", { name: /^fund$/i }) as HTMLButtonElement).disabled,
+    ).toBe(true);
   });
 });

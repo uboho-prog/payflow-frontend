@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { scValToNative } from "@stellar/stellar-sdk";
-import { MAX_NAME_LEN, MAX_PAGE, arg } from "@/lib/payflow";
+import { MAX_NAME_LEN, MAX_PAGE, arg, validateRecipient } from "@/lib/payflow";
 
 /**
  * The typed wrappers in `payflow.ts` encode every contract argument through
@@ -52,5 +52,49 @@ describe("contract limits", () => {
 
   it("matches the plan-name byte limit", () => {
     expect(MAX_NAME_LEN).toBe(64);
+  });
+});
+
+describe("deposit_for argument encoding", () => {
+  it("encodes recipient, token and amount exactly as the contract expects", () => {
+    const recipient = "GAEWDXVDI3WI35TWTZXNQ4NTRYIG6J34XPRSNKX655LBA377M5ZOCBY5";
+    const token = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
+    const amount = 12_500_000n;
+
+    // The caller is the transaction source and is not an argument.
+    const [recipientArg, tokenArg, amountArg] = [
+      arg.address(recipient),
+      arg.address(token),
+      arg.i128(amount),
+    ];
+
+    expect(scValToNative(recipientArg)).toBe(recipient);
+    expect(scValToNative(tokenArg)).toBe(token);
+    expect(scValToNative(amountArg)).toBe(amount);
+    expect(typeof scValToNative(amountArg)).toBe("bigint");
+  });
+});
+
+describe("validateRecipient", () => {
+  const VALID = "GAEWDXVDI3WI35TWTZXNQ4NTRYIG6J34XPRSNKX655LBA377M5ZOCBY5";
+
+  it("accepts a valid Stellar account address", () => {
+    expect(validateRecipient(VALID)).toBeNull();
+    expect(validateRecipient(` ${VALID} `)).toBeNull();
+  });
+
+  it("rejects empty input", () => {
+    expect(validateRecipient("")).toBe("Enter a Stellar address.");
+    expect(validateRecipient("   ")).toBe("Enter a Stellar address.");
+  });
+
+  it("rejects addresses that are not valid ed25519 public keys", () => {
+    expect(validateRecipient("GBAD…")).toBe("That is not a valid Stellar account address.");
+    expect(validateRecipient("not an address")).toBe(
+      "That is not a valid Stellar account address.",
+    );
+    expect(validateRecipient("C" + VALID.slice(1))).toBe(
+      "That is not a valid Stellar account address.",
+    );
   });
 });

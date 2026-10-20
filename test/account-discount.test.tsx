@@ -51,6 +51,8 @@ vi.mock("@/lib/payflow", () => ({
   // payflow-contract#34 not shipped; past-due stays off.
   mandateIsPastDue: () => false,
   mandatePastDueUntil: () => null,
+  // payflow-contract#29 not shipped; the sponsor panel stays off.
+  vaultSupportsDepositFor: async () => false,
 }));
 vi.mock("@/lib/chain", () => ({ chainMandatesOf: chainMock.chainMandatesOf }));
 vi.mock("@/lib/toml", () => ({ useOrgName: () => null }));

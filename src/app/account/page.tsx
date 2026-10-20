@@ -17,10 +17,18 @@ import {
   nextChargeAmount,
   remainingDiscountCharges,
 } from "@/lib/discount";
-import { mandateIsPastDue, mandatePastDueUntil, mandatePauseUntil, payflow } from "@/lib/payflow";
+import {
+  mandateIsPastDue,
+  mandatePastDueUntil,
+  mandatePauseUntil,
+  payflow,
+  vaultSupportsDepositFor,
+  validateRecipient,
+} from "@/lib/payflow";
 import { mandateStatus } from "@/lib/payflow";
 import { useWallet } from "@/lib/wallet";
 import {
+  checkAmount,
   formatAmount,
   formatDate,
   formatPeriod,
@@ -29,6 +37,7 @@ import {
   parseAmount,
   parsePauseDate,
   resumeDate,
+  shortAddress,
 } from "@/lib/format";
 import { buildChargeSchedule, chargeShortfall } from "@/lib/schedule";
 import { describeTrialEnd } from "@/lib/trial";
@@ -64,6 +73,13 @@ export default function AccountPage() {
   const [pauseDate, setPauseDate] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [done, setDone] = useState<string | null>(null);
+  // Whether the deployed vault contract supports depositing into another
+  // account's vault (payflow-contract#29). null while the probe is in flight.
+  const [fundSupport, setFundSupport] = useState<boolean | null>(null);
+  const [fundRecipient, setFundRecipient] = useState("");
+  const [fundAmount, setFundAmount] = useState("");
+  // The recipient awaiting a second-click confirmation — one at a time.
+  const [fundFor, setFundFor] = useState<string | null>(null);
 
   // The vault holds the configured token; each mandate carries the token it
   // was opened against, which the indexer does not report.
@@ -72,6 +88,13 @@ export default function AccountPage() {
     ...(mandates ?? []).map((m) => m.token ?? config.contracts.token),
   ]);
   const vaultMeta = metaFor(metas, config.contracts.token);
+
+  /** Whether the recipient address and amount are right to submit right now. */
+  const recipientDisplayError = fundRecipient.trim()
+    ? validateRecipient(fundRecipient)
+    : null;
+  const fundAmountCheck = checkAmount(fundAmount, vaultMeta.decimals);
+  const fundStroops = fundAmountCheck.ok ? fundAmountCheck.stroops : 0n;
 
   const load = useCallback(async () => {
     if (!address) return;
@@ -113,6 +136,25 @@ export default function AccountPage() {
   useEffect(() => {
     setConfirmCancel(null);
     setPauseFor(null);
+    setFundFor(null);
+  }, [address]);
+
+  // Probe whether the deployed vault contract carries deposit_for. The sponsor
+  // control stays hidden until the contract answers: a contract that predates
+  // payflow-contract#29 cannot service the write, so offering it would only
+  // fail at signing time.
+  useEffect(() => {
+    if (!address) {
+      setFundSupport(null);
+      return;
+    }
+    let live = true;
+    void vaultSupportsDepositFor(address).then((supported) => {
+      if (live) setFundSupport(supported);
+    });
+    return () => {
+      live = false;
+    };
   }, [address]);
 
   async function run(key: string, fn: () => Promise<string>) {
@@ -127,6 +169,22 @@ export default function AccountPage() {
     } finally {
       setBusy(null);
     }
+  }
+
+  /** Reveal Keep/Confirm for the sponsor deposit. One recipient at a time. */
+  async function fundAnother() {
+    if (recipientDisplayError || !fundAmountCheck.ok) return;
+    setFundFor(fundRecipient.trim());
+  }
+
+  async function fundConfirmed() {
+    if (!address || !signXdr || !fundFor || !fundAmountCheck.ok) return;
+    await run(`fund-for-${fundFor}`, () =>
+      payflow.depositFor(address, signXdr, fundFor, config.contracts.token, fundAmountCheck.stroops),
+    );
+    setFundFor(null);
+    setFundRecipient("");
+    setFundAmount("");
   }
 
   async function handleCancelAll() {
@@ -347,6 +405,94 @@ export default function AccountPage() {
           </button>
         </div>
       </Panel>
+
+      {fundSupport === true && (
+        <Panel
+          title="Fund another account"
+          subtitle="Send tokens to someone else's vault. Only the recipient can withdraw — you cannot cancel or refund the deposit."
+        >
+          {fundFor ? (
+            <div className="space-y-3">
+              <p className="text-sm">
+                <span className="font-mono truncate">{shortAddress(address)}</span>{" "}
+                pays{" "}
+                <span className="font-medium">{formatAmount(fundStroops, vaultMeta)}</span>{" "}
+                into <span className="font-mono truncate">{shortAddress(fundFor)}</span>{"'s vault"}
+              </p>
+              <p className="mt-1 text-xs text-muted">
+                Only{" "}
+                <span className="font-mono truncate">{shortAddress(fundFor)}</span> can withdraw
+                it — you cannot cancel or refund this deposit.
+              </p>
+              <div className="flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  className="btn-primary"
+                  disabled={busy !== null || networkMismatch}
+                  onClick={fundConfirmed}
+                >
+                  {busy === `fund-for-${fundFor}` ? "Funding…" : "Fund"}
+                </button>
+                <button
+                  type="button"
+                  className="btn-ghost"
+                  disabled={busy !== null}
+                  onClick={() => setFundFor(null)}
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div className="flex flex-wrap items-end gap-3">
+              <div className="min-w-[14rem] flex-1">
+                <label className="label" htmlFor="fund-recipient">
+                  Recipient address
+                </label>
+                <input
+                  id="fund-recipient"
+                  className="input"
+                  placeholder="GABC…"
+                  value={fundRecipient}
+                  onChange={(e) => setFundRecipient(e.target.value)}
+                  aria-invalid={Boolean(recipientDisplayError)}
+                  aria-describedby={recipientDisplayError ? "fund-recipient-error" : undefined}
+                  disabled={busy !== null}
+                />
+                {recipientDisplayError && (
+                  <p id="fund-recipient-error" className="mt-1 text-sm text-danger">
+                    {recipientDisplayError}
+                  </p>
+                )}
+              </div>
+              <div className="min-w-[12rem] flex-1">
+                <AmountInput
+                  id="fund-amount"
+                  label={`Amount (${vaultMeta.symbol})`}
+                  value={fundAmount}
+                  onChange={setFundAmount}
+                  decimals={vaultMeta.decimals}
+                  placeholder="5.0"
+                  disabled={busy !== null}
+                />
+              </div>
+              <button
+                type="button"
+                className="btn-primary"
+                disabled={
+                  busy !== null ||
+                  networkMismatch ||
+                  Boolean(recipientDisplayError) ||
+                  !fundAmountCheck.ok
+                }
+                onClick={fundAnother}
+              >
+                {busy === "fund-another" ? "Funding…" : "Fund"}
+              </button>
+            </div>
+          )}
+        </Panel>
+      )}
 
       <Panel
         title="Vault history"

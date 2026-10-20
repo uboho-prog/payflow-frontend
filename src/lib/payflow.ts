@@ -2,6 +2,7 @@ import {
   Address,
   BASE_FEE,
   Contract,
+  StrKey,
   TransactionBuilder,
   nativeToScVal,
   scValToNative,
@@ -483,6 +484,40 @@ export function mandateRefundableAmount(mandate: unknown): bigint | null {
   return null;
 }
 
+/** A Stellar account a sponsor can pay into: a valid ed25519 public key. */
+export function validateRecipient(recipient: string): string | null {
+  const trimmed = recipient.trim();
+  if (!trimmed) return "Enter a Stellar address.";
+  return StrKey.isValidEd25519PublicKey(trimmed)
+    ? null
+    : "That is not a valid Stellar account address.";
+}
+
+/**
+ * Whether the deployed vault contract exposes `deposit_for`.
+ *
+ * readContract simulates without committing, so a failed probe costs nothing
+ * and no tokens move. A contract built before payflow-contract#29 has no such
+ * method, so the simulation throws and the UI keeps the sponsor control
+ * hidden rather than offering a write it cannot service.
+ */
+export async function vaultSupportsDepositFor(source: string): Promise<boolean> {
+  if (!config.contracts.vault) return false;
+  try {
+    // Probe depositing the smallest possible amount into the caller's own
+    // vault: if the method exists the contract answers, and nothing commits.
+    await readContract(
+      config.contracts.vault,
+      "deposit_for",
+      source,
+      [arg.address(source), arg.address(config.contracts.token), arg.i128(1n)],
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export const payflow = {
   // Proposed read interface for #25's open-mandate counter. Callers must
   // tolerate missing support until the contract ships this getter.
@@ -547,6 +582,25 @@ export const payflow = {
   withdraw: (source: string, sign: SignXdr, token: string, amount: bigint) =>
     writeContract(config.contracts.vault, "withdraw", source, sign, [
       arg.address(source),
+      arg.address(token),
+      arg.i128(amount),
+    ]),
+
+  /**
+   * Sponsor another account's vault: the caller's tokens are credited to the
+   * recipient's vault balance, and only the recipient can withdraw.
+   *
+   * Built against the interface proposed in payflow-contract#29:
+   * `deposit_for(recipient: Address, token: Address, amount: i128)`. The
+   * caller is the transaction's source account and is not passed as an
+   * argument — it authorizes the payment by signing the transaction.
+   *
+   * Only call this when `vaultSupportsDepositFor` confirms the deployed
+   * contract carries the method.
+   */
+  depositFor: (source: string, sign: SignXdr, recipient: string, token: string, amount: bigint) =>
+    writeContract(config.contracts.vault, "deposit_for", source, sign, [
+      arg.address(recipient),
       arg.address(token),
       arg.i128(amount),
     ]),
