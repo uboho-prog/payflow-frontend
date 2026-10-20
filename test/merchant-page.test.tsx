@@ -30,6 +30,10 @@ const apiMock = vi.hoisted(() => ({
   merchantRevenue: vi.fn(),
   merchantChurn: vi.fn(),
   planStats: vi.fn(),
+  webhooks: vi.fn(),
+  addWebhook: vi.fn(),
+  deleteWebhook: vi.fn(),
+  testWebhook: vi.fn(),
 }));
 
 const payflowMock = vi.hoisted(() => ({
@@ -49,7 +53,10 @@ const chainMock = vi.hoisted(() => ({
 }));
 
 vi.mock("@/lib/wallet", () => ({ useWallet: () => wallet }));
-vi.mock("@/lib/api", () => ({ api: apiMock }));
+vi.mock("@/lib/api", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/api")>();
+  return { api: apiMock, checkWebhookUrl: actual.checkWebhookUrl };
+});
 vi.mock("@/lib/payflow", () => ({ payflow: payflowMock, MAX_NAME_LEN: 64, nameByteLength: (n: string) => n.length }));
 vi.mock("@/lib/chain", () => chainMock);
 
@@ -65,6 +72,7 @@ beforeEach(() => {
   apiMock.merchantRevenue.mockResolvedValue(null);
   apiMock.merchantChurn.mockResolvedValue(null);
   apiMock.planStats.mockResolvedValue(null);
+  apiMock.webhooks.mockResolvedValue([]);
   chainMock.chainPlanSubscriberCount.mockResolvedValue(null);
   payflowMock.feeBps.mockResolvedValue(100); // 1%
   payflowMock.createPlan.mockResolvedValue("tx-hash");

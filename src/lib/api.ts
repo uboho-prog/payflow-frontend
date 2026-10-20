@@ -103,6 +103,45 @@ export interface ApiCharge {
   ledger: number;
 }
 
+export interface ApiWebhook {
+  id: string;
+  url: string;
+  events: string[];
+  created_at: number;
+  /**
+   * The signing secret the backend sends with every webhook request so the
+   * merchant can verify the payload came from payflow. Only included in the
+   * creation response and shown to the merchant once — the backend cannot
+   * re-send it.
+   */
+  secret?: string;
+}
+
+/**
+ * What a form should say about a webhook URL the merchant typed.
+ *
+ * Webhooks deliver over the public internet, so only https endpoints are
+ * accepted — an http URL would send payloads (and secrets) in the clear.
+ */
+export type WebhookUrlCheck =
+  | { ok: true; url: string }
+  | { ok: false; message: string };
+
+export function checkWebhookUrl(input: string): WebhookUrlCheck {
+  const trimmed = input.trim();
+  if (!trimmed) return { ok: false, message: "Enter a webhook URL." };
+  let url: URL;
+  try {
+    url = new URL(trimmed);
+  } catch {
+    return { ok: false, message: "Enter a valid URL." };
+  }
+  if (url.protocol !== "https:") {
+    return { ok: false, message: "The URL must use https." };
+  }
+  return { ok: true, url: url.toString() };
+}
+
 export type VaultEventType = "deposit" | "withdraw" | "debit";
 
 export interface ApiVaultEvent {
@@ -173,6 +212,33 @@ async function get<T>(path: string): Promise<T | null> {
   }
 }
 
+async function post<T>(path: string, body: unknown): Promise<T | null> {
+  try {
+    const res = await fetch(`${config.apiUrl}${path}`, {
+      method: "POST",
+      cache: "no-store",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as T;
+  } catch {
+    return null;
+  }
+}
+
+async function del(path: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${config.apiUrl}${path}`, {
+      method: "DELETE",
+      cache: "no-store",
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
 export const api = {
   /** Whether the backend URL was explicitly supplied for this build. */
   isConfigured: () => Boolean(process.env.NEXT_PUBLIC_API_URL?.trim()),
@@ -225,6 +291,21 @@ export const api = {
    * endpoint — the UI must hide the stats section rather than show stale zeros.
    */
   planStats: (planId: number) => get<ApiPlanStats>(`/api/plans/${planId}/stats`),
+  webhooks: (merchant: string) =>
+    get<{ webhooks: ApiWebhook[] }>(`/api/merchants/${merchant}/webhooks`).then(
+      (body) => body?.webhooks ?? null,
+    ),
+  /**
+   * Proposed by payflow-backend#5. Returns the created webhook including the
+   * signing secret, which the merchant must copy immediately — it is shown
+   * once and never returned again.
+   */
+  addWebhook: (merchant: string, body: { url: string; events: string[] }) =>
+    post<ApiWebhook>(`/api/merchants/${merchant}/webhooks`, body),
+  deleteWebhook: (merchant: string, id: string) =>
+    del(`/api/merchants/${merchant}/webhooks/${id}`),
+  testWebhook: (merchant: string, id: string) =>
+    post<{ ok: boolean }>(`/api/merchants/${merchant}/webhooks/${id}/test`, {}),
   /**
    * Recent charges across the protocol, proposed by payflow-backend#30.
    *

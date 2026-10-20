@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
-import { api, type ApiMandate, type ApiPlan, type MerchantSummary } from "@/lib/api";
+import { api, checkWebhookUrl, type ApiMandate, type ApiPlan, type ApiWebhook, type MerchantSummary } from "@/lib/api";
 import { RevenueChart } from "@/components/RevenueChart";
 import { buildCsv, downloadCsv, exportFilename, type ChargeRow } from "@/lib/csv";
 import { fillBuckets, parseRevenue, type BucketSize, type RevenuePoint } from "@/lib/revenue";
@@ -23,6 +23,7 @@ import {
   checkAmount,
   feeSplit,
   formatAmount,
+  formatDate,
   formatFeeBps,
   formatPeriod,
   fromStroops,
@@ -188,6 +189,274 @@ function MerchantChurnPanel({
             </tbody>
           </table>
         </div>
+      )}
+    </Panel>
+  );
+}
+
+/**
+ * Events the backend can deliver to a merchant's webhook endpoints.
+ *
+ * Kept as a fixed list so the merchant cannot invent events the backend does
+ * not send — payflow-backend#5 defines the final set.
+ */
+const WEBHOOK_EVENTS: ReadonlyArray<{ value: string; label: string }> = [
+  { value: "charge", label: "Charge settled" },
+  { value: "refund", label: "Refund issued" },
+  { value: "mandate_ended", label: "Mandate ended" },
+];
+
+/**
+ * Webhook settings: register, list and test HTTPS endpoints the backend
+ * POSTs charge events to. Hidden entirely when the backend does not serve
+ * the webhook endpoints (NEXT_PUBLIC_API_URL unset, or a 404 from the indexer).
+ */
+function WebhooksPanel({
+  merchant,
+  apiConfigured,
+}: {
+  merchant: string;
+  apiConfigured: boolean;
+}) {
+  const [webhooks, setWebhooks] = useState<ApiWebhook[] | null>(null);
+  const [url, setUrl] = useState("");
+  const [events, setEvents] = useState<string[]>([]);
+  const [showSecret, setShowSecret] = useState<{ id: string; secret: string } | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [done, setDone] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!apiConfigured) {
+      setWebhooks(null);
+      return;
+    }
+    setWebhooks(null);
+    let live = true;
+    void api.webhooks(merchant).then((list) => {
+      if (live) setWebhooks(list);
+    });
+    return () => {
+      live = false;
+    };
+  }, [apiConfigured, merchant]);
+
+  if (!apiConfigured) return null;
+
+  const urlCheck = checkWebhookUrl(url);
+  const usable = urlCheck.ok && events.length > 0;
+
+  async function addWebhook() {
+    if (!urlCheck.ok || events.length === 0) return;
+    setBusy("webhook-add");
+    setError(null);
+    setDone(null);
+    try {
+      const created = await api.addWebhook(merchant, { url: urlCheck.url, events });
+      if (!created) {
+        setError("The backend could not create the webhook.");
+        return;
+      }
+      setShowSecret({ id: created.id, secret: created.secret ?? "" });
+      setWebhooks((prev) => (prev ? [...prev, created] : [created]));
+      setUrl("");
+      setEvents([]);
+      setDone("Webhook created.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function deleteWebhook(id: string) {
+    setBusy(`webhook-delete-${id}`);
+    try {
+      const ok = await api.deleteWebhook(merchant, id);
+      if (!ok) {
+        setError("The backend could not delete the webhook.");
+        return;
+      }
+      setWebhooks((prev) => (prev ? prev.filter((w) => w.id !== id) : prev));
+      setDone("Webhook deleted.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(null);
+      setConfirmDelete(null);
+    }
+  }
+
+  async function testWebhook(id: string) {
+    setBusy(`webhook-test-${id}`);
+    try {
+      const ok = await api.testWebhook(merchant, id);
+      if (!ok) {
+        setError("The test event could not be sent.");
+        return;
+      }
+      setDone("Test event sent.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  function toggleEvent(value: string) {
+    setEvents((prev) => (prev.includes(value) ? prev.filter((e) => e !== value) : [...prev, value]));
+  }
+
+  return (
+    <Panel
+      title="Webhook settings"
+      subtitle="Endpoints the backend POSTs charge events to. Each request is signed with a secret shown once when the webhook is created."
+    >
+      {error && <Notice tone="error">{error}</Notice>}
+      {done && <Notice tone="ok">{done}</Notice>}
+      {webhooks === null ? (
+        <SkeletonRows rows={2} label="Loading webhooks" />
+      ) : (
+        <>
+          <div className="mt-3 rounded-lg border border-edge p-3">
+            <p className="text-sm font-medium">Add a webhook</p>
+            <div className="mt-2 flex flex-wrap items-end gap-3">
+              <div className="min-w-[16rem] flex-1">
+                <label className="label" htmlFor="webhook-url">
+                  URL
+                </label>
+                <input
+                  id="webhook-url"
+                  className="input"
+                  placeholder="https://hooks.example.com/payflow"
+                  value={url}
+                  onChange={(e) => setUrl(e.target.value)}
+                  disabled={busy === "webhook-add"}
+                  aria-invalid={url.length > 0 && !urlCheck.ok}
+                  aria-describedby={
+                    url.length > 0 && !urlCheck.ok ? "webhook-url-error" : undefined
+                  }
+                />
+                {url.length > 0 && !urlCheck.ok && (
+                  <p id="webhook-url-error" className="mt-1 text-sm text-danger">
+                    {urlCheck.message}
+                  </p>
+                )}
+              </div>
+              <div className="min-w-[14rem] flex-1">
+                <p className="text-sm font-medium mb-2">Events</p>
+                <div className="space-y-1">
+                  {WEBHOOK_EVENTS.map((option) => (
+                    <label key={option.value} className="flex items-start gap-2">
+                      <input
+                        type="checkbox"
+                        checked={events.includes(option.value)}
+                        onChange={() => toggleEvent(option.value)}
+                        disabled={busy === "webhook-add"}
+                      />
+                      {option.label}
+                    </label>
+                  ))}
+                </div>
+              </div>
+              <button
+                type="button"
+                className="btn-primary"
+                disabled={busy === "webhook-add" || !usable}
+                onClick={addWebhook}
+              >
+                {busy === "webhook-add" ? "Adding…" : "Add webhook"}
+              </button>
+            </div>
+          </div>
+
+          {showSecret && (
+            <div className="mt-3 rounded-lg border border-accent/40 bg-accent/10 p-3">
+              <p className="text-sm font-medium">Signing secret (shown once)</p>
+              <div className="mt-2 flex items-end gap-2">
+                <input
+                  id="webhook-secret"
+                  className="input mono flex-1"
+                  readOnly
+                  value={showSecret.secret}
+                  aria-label="Copy the signing secret"
+                />
+                <CopyButton value={showSecret.secret} label="signing secret" />
+              </div>
+              <p className="mt-1 text-xs text-muted">
+                Copy it now — the backend never returns this secret again.
+              </p>
+            </div>
+          )}
+
+          <div className="mt-4 space-y-3">
+            {webhooks.length === 0 ? (
+              <Empty
+                title="No webhooks yet"
+              >
+                Register an endpoint above so the backend can POST charge
+                events to your own systems. Events are delivered over https
+                and signed with the webhook{"'s"} secret.
+              </Empty>
+            ) : (
+              webhooks.map((w) => (
+                <div key={w.id} className="rounded-lg border border-edge p-4">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div>
+                      <div className="font-medium mono truncate" title={w.url}>
+                        {w.url}
+                      </div>
+                      <div className="mt-1 text-xs text-muted">
+                        {w.events.join(", ")} · {formatDate(w.created_at)}
+                      </div>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      {confirmDelete === w.id ? (
+                        <>
+                          <button
+                            type="button"
+                            className="btn-ghost"
+                            disabled={busy !== null}
+                            onClick={() => setConfirmDelete(null)}
+                          >
+                            Keep
+                          </button>
+                          <button
+                            type="button"
+                            className="btn-danger"
+                            disabled={busy !== null}
+                            onClick={() => void deleteWebhook(w.id)}
+                          >
+                            {busy === `webhook-delete-${w.id}` ? "Deleting…" : "Delete"}
+                          </button>
+                        </>
+                      ) : (
+                        <button
+                          type="button"
+                          className="btn-ghost text-danger"
+                          disabled={busy !== null}
+                          onClick={() => setConfirmDelete(w.id)}
+                          aria-label={`Delete webhook ${w.url}`}
+                        >
+                          Delete
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        className="btn-ghost"
+                        disabled={busy !== null}
+                        onClick={() => void testWebhook(w.id)}
+                      >
+                        {busy === `webhook-test-${w.id}` ? "Testing…" : "Send test"}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        </>
       )}
     </Panel>
   );
@@ -1323,6 +1592,8 @@ export default function MerchantPage() {
           </div>
         )}
       </Panel>
+
+      <WebhooksPanel merchant={address} apiConfigured={api.isConfigured()} />
     </div>
   );
 }

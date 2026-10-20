@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, afterEach } from "vitest";
-import { api } from "@/lib/api";
+import { api, checkWebhookUrl } from "@/lib/api";
 
 /**
  * `api.ts` is the only seam between the UI and the indexer backend. The whole
@@ -187,5 +187,115 @@ describe("api.planStats", () => {
     });
     await api.planStats(99);
     expect(seenUrl).toContain("/api/plans/99/stats");
+  });
+});
+
+describe("checkWebhookUrl", () => {
+  it("accepts https URLs", () => {
+    expect(checkWebhookUrl("https://hooks.example.com/payflow")).toEqual({
+      ok: true,
+      url: "https://hooks.example.com/payflow",
+    });
+  });
+
+  it("rejects http URLs", () => {
+    expect(checkWebhookUrl("http://hooks.example.com/payflow")).toEqual({
+      ok: false,
+      message: "The URL must use https.",
+    });
+  });
+
+  it("rejects empty and invalid input", () => {
+    expect(checkWebhookUrl("")).toEqual({ ok: false, message: "Enter a webhook URL." });
+    expect(checkWebhookUrl("   ")).toEqual({ ok: false, message: "Enter a webhook URL." });
+    expect(checkWebhookUrl("not a url")).toEqual({ ok: false, message: "Enter a valid URL." });
+    expect(checkWebhookUrl("ftp://example.com/x")).toEqual({
+      ok: false,
+      message: "The URL must use https.",
+    });
+  });
+});
+
+describe("api webhooks", () => {
+  const WEBHOOK = {
+    id: "wh_1",
+    url: "https://hooks.example.com/payflow",
+    events: ["charge"],
+    secret: "whsec_s3cr3t",
+  };
+
+  it("lists webhooks for a merchant", async () => {
+    let seenUrl = "";
+    mockFetch(async (url) => {
+      seenUrl = String(url);
+      return jsonResponse({ webhooks: [WEBHOOK] });
+    });
+    expect(await api.webhooks("GABC")).toEqual([WEBHOOK]);
+    expect(seenUrl).toContain("/api/merchants/GABC/webhooks");
+  });
+
+  it("returns null when the backend does not serve webhooks", async () => {
+    mockFetch(async () => jsonResponse({ error: "not found" }, 404, false));
+    expect(await api.webhooks("GABC")).toBeNull();
+
+    mockFetch(() => Promise.reject(new Error("ENETUNREACH")));
+    expect(await api.webhooks("GABC")).toBeNull();
+  });
+
+  it("posts the url and events when creating a webhook", async () => {
+    let seenBody = "";
+    mockFetch(async (url, init) => {
+      expect(String(url)).toContain("/api/merchants/GABC/webhooks");
+      expect(init?.method).toBe("POST");
+      expect((init?.headers as Record<string, string> | undefined)?.["Content-Type"]).toBe(
+        "application/json",
+      );
+      seenBody = String(init?.body);
+      return jsonResponse(WEBHOOK, 201);
+    });
+    expect(await api.addWebhook("GABC", { url: WEBHOOK.url, events: WEBHOOK.events })).toEqual(
+      WEBHOOK,
+    );
+    expect(seenBody).toContain(WEBHOOK.url);
+    expect(seenBody).toContain("charge");
+  });
+
+  it("returns null when creating a webhook fails", async () => {
+    mockFetch(async () => jsonResponse({ error: "conflict" }, 409, false));
+    expect(await api.addWebhook("GABC", { url: WEBHOOK.url, events: ["charge"] })).toBeNull();
+  });
+
+  it("deletes a webhook with a DELETE request", async () => {
+    let seenUrl = "";
+    let seenMethod = "";
+    mockFetch(async (url, init) => {
+      seenUrl = String(url);
+      seenMethod = init?.method ?? "";
+      return jsonResponse(null);
+    });
+    expect(await api.deleteWebhook("GABC", WEBHOOK.id)).toBe(true);
+    expect(seenUrl).toContain(`/api/merchants/GABC/webhooks/${WEBHOOK.id}`);
+    expect(seenMethod).toBe("DELETE");
+  });
+
+  it("reports delete failure as false", async () => {
+    mockFetch(async () => jsonResponse({ error: "not found" }, 404, false));
+    expect(await api.deleteWebhook("GABC", WEBHOOK.id)).toBe(false);
+  });
+
+  it("posts a test event", async () => {
+    let seenUrl = "";
+    mockFetch(async (url, init) => {
+      seenUrl = String(url);
+      expect(init?.method).toBe("POST");
+      return jsonResponse({ ok: true });
+    });
+    expect(await api.testWebhook("GABC", WEBHOOK.id)).toEqual({ ok: true });
+    expect(seenUrl).toContain(`/api/merchants/GABC/webhooks/${WEBHOOK.id}/test`);
+  });
+
+  it("returns null when the test event cannot be sent", async () => {
+    mockFetch(() => Promise.reject(new Error("ENETUNREACH")));
+    expect(await api.testWebhook("GABC", WEBHOOK.id)).toBeNull();
   });
 });
